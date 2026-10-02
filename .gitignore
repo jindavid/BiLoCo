@@ -1,0 +1,13 @@
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+.ninja_deps
+.ninja_log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.pt
+*.json
+*.log

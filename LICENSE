@@ -1,0 +1,33 @@
+MIT License
+
+Copyright (c) 2026 The BiLoCo Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+THIRD-PARTY NOTICES
+
+This project builds against NVIDIA CUTLASS, which is not vendored here: it is
+referenced as a git submodule (third_party/cutlass, pinned to 8debf774) and
+modified before the build by patches/cutlass_biloco.patch. CUTLASS is distributed
+by NVIDIA Corporation under the BSD-3-Clause license; see
+third_party/cutlass/LICENSE.txt after initializing the submodule. The patch adds
+one header (binarysvd_side_hook.hpp) and calls to it in the SM100 warp-specialized
+GEMM kernels, tile schedulers and epilogue, used to launch and run the side CTAs.

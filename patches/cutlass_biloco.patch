@@ -1,0 +1,520 @@
+diff -ruN a/include/cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp b/include/cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp
+--- a/include/cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -287,6 +287,7 @@
+     using TMA_C = decltype(get_tma_load_c (repeat_like(append<3>(StrideC{},_1{}), int32_t(0)), Arguments{}));
+     using TMA_D = decltype(get_tma_store_d(repeat_like(append<3>(StrideD{},_1{}), int32_t(0)), Arguments{}));
+ 
++    using FusionParamsT = typename FusionCallbacks::Params;
+     typename FusionCallbacks::Params thread{};
+     TMA_C tma_load_c;
+     TMA_D tma_store_d;
+@@ -449,7 +450,7 @@
+     return fusion_callbacks.is_producer_load_needed();
+   }
+ 
+-  template<
++template<
+     bool ReuseTmem = false,
+     class ProblemShapeMNKL,
+     class CtaTileMNK,
+diff -ruN a/include/cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp b/include/cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp
+--- a/include/cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -36,6 +36,9 @@
+ 
+ #pragma once
+ 
++#include <type_traits>
++#include <utility>
++
+ #include "cutlass/cutlass.h"
+ #include "cutlass/workspace.h"
+ #include "cutlass/detail/helper_macros.hpp"
+@@ -46,6 +49,7 @@
+ 
+ namespace cutlass::epilogue::fusion {
+ 
++
+ using namespace cute;
+ using cute::tuple;
+ 
+@@ -515,7 +519,7 @@
+     );
+   }
+ 
+-  // Producer load callbacks factory
++// Producer load callbacks factory
+   // All operations must redefine this, but most can just dispatch to the base impl
+   template <class... Args>
+   CUTLASS_DEVICE auto
+diff -ruN a/include/cutlass/gemm/kernel/binarysvd_side_hook.hpp b/include/cutlass/gemm/kernel/binarysvd_side_hook.hpp
+--- a/include/cutlass/gemm/kernel/binarysvd_side_hook.hpp	1969-12-31 19:00:00.000000000 -0500
++++ b/include/cutlass/gemm/kernel/binarysvd_side_hook.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -0,0 +1,133 @@
++#pragma once
++// BiLoCo side-CTA hook: the kernel launches one extra grid
++// layer of CTAs beyond the tile grid; those CTAs run a fusion-op-provided side
++// function (binary low-rank z computation) and exit before any pipeline init.
++// Detection is by expression SFINAE on the fusion params: the zU fusion op is
++// child 1 of the EVT (member `op_1` of the 2..4-op visitor Params structs, or
++// tuple element 1), and exposes `num_side` and a static `side_cta`.
++#include "cute/container/tuple.hpp"
++namespace cutlass::gemm::kernel::detail {
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_elem1(FP const& p, int) -> decltype((p.op_1)) { return p.op_1; }
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_elem1(FP const& p, long) -> decltype(cute::get<1>(p)) { return cute::get<1>(p); }
++
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_num_side_impl(FP const& p, int) -> decltype(int(bsvd_elem1(p, 0).num_side)) { return bsvd_elem1(p, 0).num_side; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_num_side_impl(FP const&, long) { return 0; }
++
++template <class FP>
++CUTLASS_DEVICE auto bsvd_side_run_impl(FP const& p, char* smem, int idx, int)
++    -> decltype(cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::side_cta(bsvd_elem1(p, 0), smem, idx), void()) {
++  cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::side_cta(bsvd_elem1(p, 0), smem, idx);
++}
++template <class FP>
++CUTLASS_DEVICE void bsvd_side_run_impl(FP const&, char*, int, long) {}
++
++// tile CTAs: optional pre-GEMM work (fusion op exposes a static tile_pre(op, smem, tile_idx, n_tiles)),
++// run at kernel entry while the whole shared memory is still free
++template <class FP>
++CUTLASS_DEVICE auto bsvd_tile_pre_impl(FP const& p, char* smem, int t, int nt, int)
++    -> decltype(cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_pre(bsvd_elem1(p, 0), smem, t, nt), void()) {
++  cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_pre(bsvd_elem1(p, 0), smem, t, nt);
++}
++template <class FP>
++CUTLASS_DEVICE void bsvd_tile_pre_impl(FP const&, char*, int, int, long) {}
++
++// tile CTAs: entry hook with the fusion op's shared storage (fusion op exposes a static tile_entry(op, fusion_smem, tile_idx))
++template <class FP, class FS>
++CUTLASS_DEVICE auto bsvd_tile_entry_impl(FP const& p, FS* fs, int t, int)
++    -> decltype(cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_entry(bsvd_elem1(p, 0), static_cast<void*>(nullptr), t), void()) {
++  cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_entry(bsvd_elem1(p, 0), reinterpret_cast<void*>(&cute::get<1>(*fs)), t);
++}
++template <class FP, class FS>
++CUTLASS_DEVICE void bsvd_tile_entry_impl(FP const&, FS*, int, long) {}
++
++// tile CTAs: idle warps (sched after its loop, epilogue-load when unused) help the fusion op's epilogue
++// (fusion op exposes a static tile_helper(op, fusion_smem, tile_n, helper_warp))
++template <class FP, class FS>
++CUTLASS_DEVICE auto bsvd_tile_helper_impl(FP const& p, FS* fs, int tn, int hw, int)
++    -> decltype(cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_helper(bsvd_elem1(p, 0), static_cast<void*>(nullptr), tn, hw), void()) {
++  cute::remove_cvref_t<decltype(bsvd_elem1(p, 0))>::tile_helper(bsvd_elem1(p, 0), reinterpret_cast<void*>(&cute::get<1>(*fs)), tn, hw);
++}
++template <class FP, class FS>
++CUTLASS_DEVICE void bsvd_tile_helper_impl(FP const&, FS*, int, int, long) {}
++
++// Cluster mode (fusion op exposes cl_S > 0): the grid is cl_C clusters of cl_S CTAs whose first
++// cl_T CTAs are GEMM tiles and the rest side CTAs, plus side-only clusters up to cl_grid CTAs.
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_cl_S_impl(FP const& p, int) -> decltype(int(p.op_1.cl_S)) { return p.op_1.cl_S; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_cl_S_impl(FP const&, long) { return 0; }
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_cl_T_impl(FP const& p, int) -> decltype(int(p.op_1.cl_T)) { return p.op_1.cl_T; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_cl_T_impl(FP const&, long) { return 0; }
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_cl_C_impl(FP const& p, int) -> decltype(int(p.op_1.cl_C)) { return p.op_1.cl_C; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_cl_C_impl(FP const&, long) { return 0; }
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_cl_F_impl(FP const& p, int) -> decltype(int(p.op_1.cl_F)) { return p.op_1.cl_F; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_cl_F_impl(FP const&, long) { return 0; }
++template <class FP>
++CUTLASS_HOST_DEVICE auto bsvd_cl_grid_impl(FP const& p, int) -> decltype(int(p.op_1.cl_grid)) { return p.op_1.cl_grid; }
++template <class FP>
++CUTLASS_HOST_DEVICE int bsvd_cl_grid_impl(FP const&, long) { return 0; }
++template <class FP, class FS>
++CUTLASS_DEVICE auto bsvd_cl_side_impl(FP const& p, char* smem, FS* fs, int c, int r, int)
++    -> decltype(p.op_1.cl_S, void()) {
++  cute::remove_cvref_t<decltype(p.op_1)>::side_cluster(p.op_1, smem, reinterpret_cast<void*>(&cute::get<1>(*fs)), c, r);
++}
++template <class FP, class FS>
++CUTLASS_DEVICE void bsvd_cl_side_impl(FP const&, char*, FS*, int, int, long) {}
++template <class FP, class FS>
++CUTLASS_DEVICE auto bsvd_cl_tile_impl(FP const& p, FS* fs, int)
++    -> decltype(p.op_1.cl_S, void()) {
++  cute::remove_cvref_t<decltype(p.op_1)>::tile_prologue(p.op_1, reinterpret_cast<void*>(&cute::get<1>(*fs)));
++}
++template <class FP, class FS>
++CUTLASS_DEVICE void bsvd_cl_tile_impl(FP const&, FS*, long) {}
++// static scheduler: pin the CTA's linear tile index (cluster mode)
++template <class Sch>
++CUTLASS_DEVICE auto bsvd_sched_set_impl(Sch& s, uint64_t idx, uint64_t total, int) -> decltype(s.bsvd_set_linear(idx, total), void()) {
++  s.bsvd_set_linear(idx, total);
++}
++template <class Sch>
++CUTLASS_DEVICE void bsvd_sched_set_impl(Sch&, uint64_t, uint64_t, long) {}
++
++// cluster mode: tile coordinates without the hardware cluster offset (static scheduler's 2-arg form)
++template <class Sch, class WTI>
++CUTLASS_DEVICE auto bsvd_cta_coord_impl(Sch& s, WTI const& w, dim3 bid, int) -> decltype(s.work_tile_to_cta_coord(w, bid)) {
++  return s.work_tile_to_cta_coord(w, bid);
++}
++template <class Sch, class WTI>
++CUTLASS_DEVICE auto bsvd_cta_coord_impl(Sch& s, WTI const& w, dim3, long) -> decltype(s.work_tile_to_cta_coord(w)) {
++  return s.work_tile_to_cta_coord(w);
++}
++
++template <class FusionParams>
++struct bsvd_side_finder {
++  static constexpr int index = 1;   // resolved by SFINAE at the call sites
++  CUTLASS_HOST_DEVICE static int num_side(FusionParams const& p) { return bsvd_num_side_impl(p, 0); }
++  CUTLASS_DEVICE static void run(FusionParams const& p, char* smem, int side_idx) { bsvd_side_run_impl(p, smem, side_idx, 0); }
++  CUTLASS_DEVICE static void tile_pre(FusionParams const& p, char* smem, int t, int nt) { bsvd_tile_pre_impl(p, smem, t, nt, 0); }
++  template <class FS>
++  CUTLASS_DEVICE static void tile_entry(FusionParams const& p, FS* fs, int t) { bsvd_tile_entry_impl(p, fs, t, 0); }
++  template <class FS>
++  CUTLASS_DEVICE static void tile_helper(FusionParams const& p, FS* fs, int tn, int hw) { bsvd_tile_helper_impl(p, fs, tn, hw, 0); }
++  CUTLASS_HOST_DEVICE static int cl_S(FusionParams const& p) { return bsvd_cl_S_impl(p, 0); }
++  CUTLASS_HOST_DEVICE static int cl_T(FusionParams const& p) { return bsvd_cl_T_impl(p, 0); }
++  CUTLASS_HOST_DEVICE static int cl_C(FusionParams const& p) { return bsvd_cl_C_impl(p, 0); }
++  CUTLASS_HOST_DEVICE static int cl_grid(FusionParams const& p) { return bsvd_cl_grid_impl(p, 0); }
++  CUTLASS_HOST_DEVICE static int cl_F(FusionParams const& p) { return bsvd_cl_F_impl(p, 0); }
++  template <class FS>
++  CUTLASS_DEVICE static void cl_side(FusionParams const& p, char* smem, FS* fs, int c, int r) { bsvd_cl_side_impl(p, smem, fs, c, r, 0); }
++  template <class FS>
++  CUTLASS_DEVICE static void cl_tile(FusionParams const& p, FS* fs) { bsvd_cl_tile_impl(p, fs, 0); }
++  template <class Sch>
++  CUTLASS_DEVICE static void sched_set(Sch& s, uint64_t idx, uint64_t total) { bsvd_sched_set_impl(s, idx, total, 0); }
++};
++} // namespace cutlass::gemm::kernel::detail
+diff -ruN a/include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp b/include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp
+--- a/include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -45,6 +45,11 @@
+ #include "cutlass/gemm/dispatch_policy.hpp"
+ #include "cutlass/detail/mainloop_fusion_helper_scale_factor.hpp"
+ #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
++// BiLoCo: the mainloop does not wait on a PDL primary grid (its
++// inputs come from kernels that completed before the primary triggered); the fusion
++// epilogue issues griddepcontrol.wait itself before consuming the primary's output.
++#define BINARYSVD_PDL_TOP_WAIT() do {} while (0)
++#include "cutlass/gemm/kernel/binarysvd_side_hook.hpp"
+ #include "cutlass/pipeline/pipeline.hpp"
+ #include "cutlass/detail/sm100_tmem_helper.hpp"
+ 
+@@ -386,13 +391,28 @@
+     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, params.hw_info.cluster_shape);
+ 
+     auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
+-    return TileScheduler::get_grid_shape(
++    dim3 grid = TileScheduler::get_grid_shape(
+         params.scheduler,
+         problem_shape_MNKL,
+         TileShape{},
+         AtomThrShapeMNK{},
+         cluster_shape,
+         params.hw_info);
++    // BiLoCo cluster mode: 1-D grid of clusters (tile CTAs + side CTAs), launched with cluster dims
++    if (detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::cl_S(params.epilogue.thread) > 0) {
++      return dim3(detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::cl_grid(params.epilogue.thread), 1, 1);
++    }
++    // BiLoCo side CTAs. (tiles, 1, 1) tile grid (AlongN): one extra y layer, side index = blockIdx.x.
++    // (1, tiles, 1) tile grid (AlongM): exactly num_side extra CTAs appended along y (tiles launch first,
++    // no surplus CTAs), side index = blockIdx.y - tiles.
++    {
++      const int bsvd_ns = detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::num_side(params.epilogue.thread);
++      if (bsvd_ns > 0) {
++        if (grid.x == 1 && grid.y > 1) grid.y += bsvd_ns;
++        else grid.y += 1;
++      }
++    }
++    return grid;
+   }
+ 
+   static dim3
+@@ -413,6 +433,47 @@
+     auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
+     auto [M,N,K,L] = problem_shape_MNKL;
+ 
++    int bsvd_cl_tile = -1;       // cluster mode: this tile CTA's linear tile index
++    int bsvd_cl_tiles = 0;
++    {
++      using SideFinder = detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>;
++      if constexpr (SideFinder::index >= 0) {
++        const int cS = SideFinder::cl_S(params.epilogue.thread);
++        if (cS > 0) {
++          const int cT = SideFinder::cl_T(params.epilogue.thread);
++          const int cC = SideFinder::cl_C(params.epilogue.thread);
++          const int cF = SideFinder::cl_F(params.epilogue.thread);
++          const int cc = int(blockIdx.x) / cS, cr = int(blockIdx.x) - (int(blockIdx.x) / cS) * cS;
++          SharedStorage& bsvd_ss = *reinterpret_cast<SharedStorage*>(smem_buf);
++          if (cc >= cC || cr < cF || cr >= cF + cT) {
++            SideFinder::cl_side(params.epilogue.thread, smem_buf, &bsvd_ss.tensors.epilogue.thread, cc, cr);
++            return;
++          }
++          SideFinder::cl_tile(params.epilogue.thread, &bsvd_ss.tensors.epilogue.thread);
++          bsvd_cl_tile = cc * cT + (cr - cF);
++          bsvd_cl_tiles = cC * cT;
++        }
++        else if (SideFinder::num_side(params.epilogue.thread) > 0) {
++          // the side CTAs: last y layer of a (tiles, 2, 1) grid, or the last num_side rows of a (1, tiles + num_side, 1) grid
++          const int bsvd_ns = SideFinder::num_side(params.epilogue.thread);
++          if (gridDim.x == 1) {
++            if (int(blockIdx.y) >= int(gridDim.y) - bsvd_ns) {
++              SideFinder::run(params.epilogue.thread, smem_buf, int(blockIdx.y) - (int(gridDim.y) - bsvd_ns));
++              return;
++            }
++            SideFinder::tile_entry(params.epilogue.thread, &reinterpret_cast<SharedStorage*>(smem_buf)->tensors.epilogue.thread, int(blockIdx.y));
++            SideFinder::tile_pre(params.epilogue.thread, smem_buf, int(blockIdx.y), int(gridDim.y) - bsvd_ns);
++          } else if (blockIdx.y == gridDim.y - 1) {
++            SideFinder::run(params.epilogue.thread, smem_buf, int(blockIdx.x));
++            return;
++          } else {
++            SideFinder::tile_entry(params.epilogue.thread, &reinterpret_cast<SharedStorage*>(smem_buf)->tensors.epilogue.thread, int(blockIdx.x));
++            SideFinder::tile_pre(params.epilogue.thread, smem_buf, int(blockIdx.x), int(gridDim.x));
++          }
++        }
++      }
++    }
++
+     // Account for more than one epilogue warp
+     int warp_idx = canonical_warp_idx_sync();
+     WarpCategory warp_category = warp_idx < static_cast<int>(WarpCategory::Epilogue) ? WarpCategory(warp_idx)
+@@ -421,7 +482,8 @@
+     uint32_t lane_predicate = cute::elect_one_sync();
+     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{});
+     int cluster_size = size(cluster_shape);
+-    uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
++    // cluster mode: the tile CTAs run the 1x1x1-cluster GEMM logic inside a hardware cluster
++    uint32_t cta_rank_in_cluster = (bsvd_cl_tile >= 0) ? 0u : cute::block_rank_in_cluster();
+     bool is_first_cta_in_cluster = cta_rank_in_cluster == 0;
+     int cta_coord_v = cta_rank_in_cluster % size<0>(typename TiledMma::AtomThrID{});
+     bool is_mma_leader_cta = cta_coord_v == 0;
+@@ -596,7 +658,7 @@
+     AccumulatorPipelineState accumulator_pipe_consumer_state;
+     AccumulatorPipelineState accumulator_pipe_producer_state = cutlass::make_producer_start_state<AccumulatorPipeline>();
+ 
+-    dim3 block_id_in_cluster = cute::block_id_in_cluster();
++    dim3 block_id_in_cluster = (bsvd_cl_tile >= 0) ? dim3(0, 0, 0) : cute::block_id_in_cluster();
+ 
+     // Calculate mask after cluster barrier arrival
+     mainloop_pipeline.init_masks(cluster_shape, block_id_in_cluster);
+@@ -604,8 +666,15 @@
+ 
+     // TileID scheduler
+     TileScheduler scheduler(&shared_storage.clc_response[0], params.scheduler, block_id_in_cluster);
++    // cluster mode: tile coordinates must not include the hardware cluster offset
++#define BSVD_CTA_COORD(wti) ((bsvd_cl_tile >= 0) ? detail::bsvd_cta_coord_impl(scheduler, (wti), block_id_in_cluster, 0) \
++                                                 : scheduler.work_tile_to_cta_coord(wti))
++    if (bsvd_cl_tile >= 0) {
++      detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::sched_set(
++          scheduler, static_cast<uint64_t>(bsvd_cl_tile), static_cast<uint64_t>(bsvd_cl_tiles));
++    }
+     typename TileScheduler::WorkTileInfo work_tile_info = scheduler.initial_work_tile_info(cluster_shape);
+-    auto cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
++    auto cta_coord_mnkl = BSVD_CTA_COORD(work_tile_info);
+     //
+     // TMEM "Allocation"
+     //
+@@ -616,7 +685,7 @@
+     if (is_participant.main_load) {
+       // Ensure that the prefetched kernel does not touch
+       // unflushed global memory prior to this instruction
+-      cutlass::arch::wait_on_dependent_grids();
++      BINARYSVD_PDL_TOP_WAIT();
+ 
+       bool do_load_order_arrive = is_epi_load_needed;
+       bool requires_clc_query = true;
+@@ -667,7 +736,7 @@
+           clc_pipe_consumer_state
+         );
+         work_tile_info = next_work_tile_info;
+-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
++        cta_coord_mnkl = BSVD_CTA_COORD(work_tile_info);
+         requires_clc_query = increment_pipe;
+         if (increment_pipe) {
+           ++clc_pipe_consumer_state;
+@@ -684,7 +753,7 @@
+         // why this variable is needed.
+         bool requires_clc_query = true;
+ 
+-        cutlass::arch::wait_on_dependent_grids();
++        BINARYSVD_PDL_TOP_WAIT();
+ 
+         do {
+           if (requires_clc_query) {
+@@ -720,6 +789,9 @@
+         } while (work_tile_info.is_valid());
+         clc_pipeline.producer_tail(clc_pipe_producer_state);
+       }
++      // BiLoCo: the sched warp helps the fusion epilogue of this CTA's (first) tile
++      detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::tile_helper(
++          params.epilogue.thread, &shared_storage.tensors.epilogue.thread, int(get<1>(cta_coord_mnkl)), 0);
+     }
+ 
+     else if (is_participant.mma) {
+@@ -771,7 +843,7 @@
+         }
+         ++accumulator_pipe_producer_state;
+         work_tile_info = next_work_tile_info;
+-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
++        cta_coord_mnkl = BSVD_CTA_COORD(work_tile_info);
+       } while (work_tile_info.is_valid());
+ 
+       // Hint on an early release of global memory resources.
+@@ -806,7 +878,7 @@
+     else if (is_participant.epi_load) {
+       // Ensure that the prefetched kernel does not touch
+       // unflushed global memory prior to this instruction
+-      cutlass::arch::wait_on_dependent_grids();
++      BINARYSVD_PDL_TOP_WAIT();
+ 
+       bool do_load_order_wait = true;
+       bool do_tail_load = false;
+@@ -851,7 +923,7 @@
+         current_wave++;
+ 
+         // Calculate the cta coordinates of the next work tile
+-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
++        cta_coord_mnkl = BSVD_CTA_COORD(work_tile_info);
+       } while (work_tile_info.is_valid());
+ 
+       // Only perform a tail load if one of the work units processed performed
+@@ -929,7 +1001,7 @@
+           do_tail_store = true;
+         }
+         work_tile_info = next_work_tile_info;
+-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
++        cta_coord_mnkl = BSVD_CTA_COORD(work_tile_info);
+ 
+       } while (work_tile_info.is_valid());
+ 
+@@ -954,6 +1026,11 @@
+     }
+ 
+     else {
++      // BiLoCo: an idle (unused epilogue-load) warp helps the fusion epilogue of this CTA's tile
++      if (warp_category == WarpCategory::EpilogueLoad) {
++        detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::tile_helper(
++            params.epilogue.thread, &shared_storage.tensors.epilogue.thread, int(get<1>(cta_coord_mnkl)), 1);
++      }
+     }
+   }
+ };
+diff -ruN a/include/cutlass/gemm/kernel/sm100_tile_scheduler.hpp b/include/cutlass/gemm/kernel/sm100_tile_scheduler.hpp
+--- a/include/cutlass/gemm/kernel/sm100_tile_scheduler.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/gemm/kernel/sm100_tile_scheduler.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -466,6 +466,12 @@
+     work_tile = swizzle_and_rasterize(
+       work_tile.M_idx, work_tile.N_idx, work_tile.L_idx, work_tile.is_valid(),
+       block_id_in_cluster_.x, block_id_in_cluster_.y);
++    // BiLoCo: a CLC response naming a side-layer CTA is not a GEMM tile
++    if (work_tile.M_idx >= static_cast<int32_t>(params_.problem_tiles_m_) ||
++        work_tile.N_idx >= static_cast<int32_t>(params_.problem_tiles_n_) ||
++        work_tile.L_idx >= static_cast<int32_t>(params_.problem_tiles_l_)) {
++      work_tile.is_valid_tile = false;
++    }
+ 
+     // Return true to indicate that the tile scheduler pipeline state should be advanced
+     return cute::make_tuple(work_tile, true);
+diff -ruN a/include/cutlass/gemm/kernel/sm103_blockscaled_gemm_tma_warpspecialized.hpp b/include/cutlass/gemm/kernel/sm103_blockscaled_gemm_tma_warpspecialized.hpp
+--- a/include/cutlass/gemm/kernel/sm103_blockscaled_gemm_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/gemm/kernel/sm103_blockscaled_gemm_tma_warpspecialized.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -44,6 +44,7 @@
+ #include "cutlass/gemm/gemm.h"
+ #include "cutlass/gemm/dispatch_policy.hpp"
+ #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
++#include "cutlass/gemm/kernel/binarysvd_side_hook.hpp"
+ #include "cutlass/pipeline/pipeline.hpp"
+ #include "cutlass/detail/sm100_tmem_helper.hpp"
+ 
+@@ -383,13 +384,18 @@
+   get_grid_shape(Params const& params) {
+     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, params.hw_info.cluster_shape);
+     auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
+-    return TileScheduler::get_grid_shape(
++    dim3 grid = TileScheduler::get_grid_shape(
+         params.scheduler,
+         problem_shape_MNKL,
+         TileShape{},
+         AtomThrShapeMNK{},
+         cluster_shape,
+         params.hw_info);
++    // BiLoCo: one extra grid layer of side CTAs (requires a (tiles, 1, 1) tile grid)
++    if (detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>::num_side(params.epilogue.thread) > 0) {
++      grid.y += 1;
++    }
++    return grid;
+   }
+ 
+   static constexpr
+@@ -433,6 +439,18 @@
+     auto K = get<2>(problem_shape_MNKL);
+     auto L = get<3>(problem_shape_MNKL);
+ 
++    {
++      using SideFinder = detail::bsvd_side_finder<typename CollectiveEpilogue::Params::FusionParamsT>;
++      if constexpr (SideFinder::index >= 0) {
++        if (SideFinder::num_side(params.epilogue.thread) > 0) {
++          // the side layer is the last y layer of the launch grid (get_grid_shape adds it)
++          if (blockIdx.y == gridDim.y - 1) {
++            SideFinder::run(params.epilogue.thread, smem_buf, int(blockIdx.x));
++            return;
++          }
++        }
++      }
++    }
+     // Account for more than one epilogue warp
+     int warp_idx = canonical_warp_idx_sync();
+     WarpCategory warp_category = (warp_idx >= static_cast<int>(WarpCategory::Epilogue) && warp_idx < static_cast<int>(WarpCategory::EpilogueLoad)) ? WarpCategory::Epilogue : 
+@@ -660,7 +678,6 @@
+     Tensor accumulators = cutlass::detail::make_sm100_accumulator<AccumulatorPipelineStageCount, IsOverlappingAccum>(
+         tiled_mma, acc_shape, EpilogueTile{});
+ 
+-#if 1
+     pipeline_init_wait(cluster_size);
+ 
+     if (is_participant.main_ab_load) {
+@@ -1104,7 +1121,6 @@
+     else {
+       set_warpgroup_reg_dealloc();
+     }
+-#endif
+   }
+ };
+ 
+diff -ruN a/include/cutlass/gemm/kernel/static_tile_scheduler.hpp b/include/cutlass/gemm/kernel/static_tile_scheduler.hpp
+--- a/include/cutlass/gemm/kernel/static_tile_scheduler.hpp	2026-09-29 19:55:43.000000000 -0400
++++ b/include/cutlass/gemm/kernel/static_tile_scheduler.hpp	2026-09-29 19:55:43.000000000 -0400
+@@ -50,6 +50,13 @@
+ private:
+   uint64_t current_work_linear_idx_;
+   uint64_t total_grid_size_;
++public:
++  // BiLoCo cluster mode: pin this CTA's linear tile index and the stride between its tiles
++  CUTLASS_DEVICE void bsvd_set_linear(uint64_t idx, uint64_t total) {
++    current_work_linear_idx_ = idx;
++    total_grid_size_ = total;
++  }
++private:
+ 
+ public:
+   struct WorkTileInfo {
+@@ -351,7 +358,8 @@
+       hw_info,
+       arguments.max_swizzle_size,
+       arguments.raster_order,
+-      /* truncate_by_problem_size = */true
++      /* truncate_by_problem_size = */
++      false  // binarysvd side-CTA grid
+     );
+   }
+ 
+@@ -379,7 +387,8 @@
+       hw_info,
+       args.max_swizzle_size,
+       args.raster_order,
+-      /* truncate_by_problem_size = */true
++      /* truncate_by_problem_size = */
++      false  // binarysvd side-CTA grid
+     );
+   }
+ 
